@@ -3,8 +3,8 @@ import warnings
 
 import streamlit as st
 from snowflake.snowpark.exceptions import SnowparkSQLException
-
-from chain import load_chain
+from langchain_core.messages import HumanMessage
+from agent import MessagesState, create_agent
 
 # from utils.snow_connect import SnowflakeConnection
 from utils.snowchat_ui import StreamlitUICallbackHandler, message_func
@@ -16,29 +16,46 @@ snow_ddl = Snowddl()
 
 gradient_text_html = """
 <style>
-.gradient-text {
-    font-weight: bold;
-    background: -webkit-linear-gradient(left, red, orange);
-    background: linear-gradient(to right, red, orange);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    display: inline;
-    font-size: 3em;
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@700;900&display=swap');
+
+.snowchat-title {
+  font-family: 'Poppins', sans-serif;
+  font-weight: 900;
+  font-size: 4em;
+  background: linear-gradient(90deg, #ff6a00, #ee0979);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  text-shadow: 2px 2px 5px rgba(0, 0, 0, 0.3);
+  margin: 0;
+  padding: 20px 0;
+  text-align: center;
 }
 </style>
-<div class="gradient-text">snowChat</div>
+<div class="snowchat-title">snowChat</div>
 """
 
 st.markdown(gradient_text_html, unsafe_allow_html=True)
 
 st.caption("Talk your way through data")
+
+model_options = {
+    "o3-mini": "o3-mini",
+    "Qwen 2.5": "Qwen 2.5",
+    "Gemini 2.0 Flash": "Gemini 2.0 Flash",
+    "Grok 2": "Grok 2",
+}
+
 model = st.radio(
-    "",
-    options=["Claude-3 Haiku", "Mixtral 8x7B", "Llama 3-70B", "GPT-3.5"],
+    "Choose your AI Model:",
+    options=list(model_options.keys()),
+    format_func=lambda x: model_options[x],
     index=0,
     horizontal=True,
 )
 st.session_state["model"] = model
+
+if "assistant_response_processed" not in st.session_state:
+    st.session_state["assistant_response_processed"] = True  # Initialize to True
 
 if "toast_shown" not in st.session_state:
     st.session_state["toast_shown"] = False
@@ -46,18 +63,18 @@ if "toast_shown" not in st.session_state:
 if "rate-limit" not in st.session_state:
     st.session_state["rate-limit"] = False
 
-# Show the toast only if it hasn't been shown before
-if not st.session_state["toast_shown"]:
-    st.toast("The snowflake data retrieval is disabled for now.", icon="👋")
-    st.session_state["toast_shown"] = True
+# # Show the toast only if it hasn't been shown before
+# if not st.session_state["toast_shown"]:
+#     st.toast("The snowflake data retrieval is disabled for now.", icon="👋")
+#     st.session_state["toast_shown"] = True
 
 # Show a warning if the model is rate-limited
 if st.session_state["rate-limit"]:
     st.toast("Probably rate limited.. Go easy folks", icon="⚠️")
     st.session_state["rate-limit"] = False
 
-if st.session_state["model"] == "Mixtral 8x7B":
-    st.warning("This is highly rate-limited. Please use it sparingly", icon="⚠️")
+if st.session_state["model"] == "Deepseek R1":
+    st.warning("Deepseek R1 is highly rate limited. Please use it sparingly", icon="⚠️")
 
 INITIAL_MESSAGE = [
     {"role": "user", "content": "Hi!"},
@@ -66,6 +83,7 @@ INITIAL_MESSAGE = [
         "content": "Hey there, I'm Chatty McQueryFace, your SQL-speaking sidekick, ready to chat up Snowflake and fetch answers faster than a snowball fight in summer! ❄️🔍",
     },
 ]
+config = {"configurable": {"thread_id": "42"}}
 
 with open("ui/sidebar.md", "r") as sidebar_file:
     sidebar_content = sidebar_file.read()
@@ -107,19 +125,30 @@ if "model" not in st.session_state:
 
 # Prompt for user input and save
 if prompt := st.chat_input():
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    if len(prompt) > 500:
+        st.error("Input is too long! Please limit your message to 500 characters.")
+    else:
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.session_state["assistant_response_processed"] = False  # Assistant response not yet processed
 
-for message in st.session_state.messages:
+messages_to_display = st.session_state.messages.copy()
+# if not st.session_state["assistant_response_processed"]:
+#     # Exclude the last assistant message if assistant response not yet processed
+#     if messages_to_display and messages_to_display[-1]["role"] == "assistant":
+#         print("\n\nthis is messages_to_display \n\n", messages_to_display)
+#         messages_to_display = messages_to_display[:-1]
+
+for message in messages_to_display:
     message_func(
         message["content"],
-        True if message["role"] == "user" else False,
-        True if message["role"] == "data" else False,
-        model,
+        is_user=(message["role"] == "user"),
+        is_df=(message["role"] == "data"),
+        model=model,
     )
 
 callback_handler = StreamlitUICallbackHandler(model)
 
-chain = load_chain(st.session_state["model"], callback_handler)
+react_graph = create_agent(callback_handler, st.session_state["model"])
 
 
 def append_chat_history(question, answer):
@@ -138,20 +167,21 @@ def append_message(content, role="assistant"):
 
 
 def handle_sql_exception(query, conn, e, retries=2):
-    append_message("Uh oh, I made an error, let me try to fix it..")
-    error_message = (
-        "You gave me a wrong SQL. FIX The SQL query by searching the schema definition:  \n```sql\n"
-        + query
-        + "\n```\n Error message: \n "
-        + str(e)
-    )
-    new_query = chain({"question": error_message, "chat_history": ""})["answer"]
-    append_message(new_query)
-    if get_sql(new_query) and retries > 0:
-        return execute_sql(get_sql(new_query), conn, retries - 1)
-    else:
-        append_message("I'm sorry, I couldn't fix the error. Please try again.")
-        return None
+    # append_message("Uh oh, I made an error, let me try to fix it..")
+    # error_message = (
+    #     "You gave me a wrong SQL. FIX The SQL query by searching the schema definition:  \n```sql\n"
+    #     + query
+    #     + "\n```\n Error message: \n "
+    #     + str(e)
+    # )
+    # new_query = chain({"question": error_message, "chat_history": ""})["answer"]
+    # append_message(new_query)
+    # if get_sql(new_query) and retries > 0:
+    #     return execute_sql(get_sql(new_query), conn, retries - 1)
+    # else:
+    #     append_message("I'm sorry, I couldn't fix the error. Please try again.")
+    #     return None
+    pass
 
 
 def execute_sql(query, conn, retries=2):
@@ -166,20 +196,25 @@ def execute_sql(query, conn, retries=2):
 
 if (
     "messages" in st.session_state
-    and st.session_state["messages"][-1]["role"] != "assistant"
+    and st.session_state["messages"][-1]["role"] == "user"
+    and not st.session_state["assistant_response_processed"]
 ):
     user_input_content = st.session_state["messages"][-1]["content"]
 
     if isinstance(user_input_content, str):
+        # Start loading animation
         callback_handler.start_loading_message()
 
-        result = chain.invoke(
-            {
-                "question": user_input_content,
-                "chat_history": [h for h in st.session_state["history"]],
-            }
-        )
-        append_message(result.content)
+        messages = [HumanMessage(content=user_input_content)]
+
+        state = MessagesState(messages=messages)
+        result = react_graph.invoke(state, config=config, debug=True)
+
+        if result["messages"]:
+            assistant_message = callback_handler.final_message
+            append_message(assistant_message)
+            st.session_state["assistant_response_processed"] = True
+
 
 if (
     st.session_state["model"] == "Mixtral 8x7B"
